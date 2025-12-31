@@ -1,198 +1,190 @@
 import os
 import re
-import asyncio
-import gc
-from threading import Thread
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from telethon.tl.types import DocumentAttributeVideo
-from telethon.tl.functions.messages import ImportChatInviteRequest
-from PIL import Image
-from flask import Flask
+import threading
+from flask import Flask, jsonify
+
+from telegram import Update
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    CallbackContext
+)
 
 # ================= ENV =================
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-TG_SESSION = os.environ["TG_SESSION"]
-TARGET_CHANNEL = int(os.environ["TARGET_CHANNEL"])
-CHANNEL_INVITE = os.environ["CHANNEL_INVITE"]
-PORT = int(os.environ.get("PORT", 10000))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", 10000))
 
-# ================= PATHS =================
-TMP = "/tmp/work"
-os.makedirs(TMP, exist_ok=True)
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN not set")
 
-thumb_src = os.path.join(TMP, "thumb_src.jpg")
-thumb_final = os.path.join(TMP, "thumb.jpg")
-
-# ================= STATE =================
-current_thumb = None
-rename_template = None
-
-paused = False
-queue = asyncio.Queue()
-
-# ================= CLIENT =================
-client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH)
-
-# ================= THUMB =================
-def optimize_thumbnail(src, dst):
-    img = Image.open(src).convert("RGB")
-    img.thumbnail((320, 320))
-    img.save(dst, "JPEG", quality=85)
-
-# ================= HELPERS =================
-def extract_episode(text, file_name):
-    patterns = [
-        r"[Ee][Pp][\s\-_:]*([0-9]+)",
-        r"[Ee][\s\-_:]*([0-9]+)",
-        r"episode[\s\-_:]*([0-9]+)",
-        r"ep([0-9]+)",
-        r"e([0-9]+)"
-    ]
-    check = (text or "") + " " + (file_name or "")
-    for p in patterns:
-        m = re.search(p, check)
-        if m:
-            return m.group(1)
-    return ""
-
-def clean_filename(name):
-    return re.sub(r"[^\w\-. ]", "_", name)
-
-async def clear_queue():
-    dropped = 0
-    while not queue.empty():
-        try:
-            queue.get_nowait()
-            queue.task_done()
-            dropped += 1
-        except:
-            break
-    return dropped
-
-# ================= QUEUE WORKER =================
-async def worker():
-    global paused
-
-    while True:
-        msg, thumb, rename = await queue.get()
-
-        while paused:
-            await asyncio.sleep(0.5)
-
-        path = None
-        try:
-            await msg.reply("⬇ Downloading…")
-            path = await msg.download_media(file=TMP)
-
-            final_path = path
-            if rename:
-                ep = extract_episode(msg.text, msg.file.name if msg.file else "")
-                name = rename.replace("{ep}", ep) + ".mp4"
-                name = clean_filename(name)
-                final_path = os.path.join(TMP, name)
-                os.rename(path, final_path)
-
-            await msg.reply("⬆ Uploading…")
-
-            await client.send_file(
-                TARGET_CHANNEL,
-                final_path,
-                caption=msg.text or "",
-                thumb=thumb,
-                attributes=[DocumentAttributeVideo(
-                    duration=msg.video.duration if msg.video else 1,
-                    w=1280,
-                    h=720,
-                    supports_streaming=True
-                )],
-                part_size_kb=256
-            )
-
-            await msg.reply("✔ Uploaded")
-
-        except Exception as e:
-            await msg.reply(f"❌ Error: {e}")
-
-        finally:
-            if path and os.path.exists(final_path):
-                os.remove(final_path)
-            gc.collect()
-            queue.task_done()
-
-# ================= EVENTS =================
-@client.on(events.NewMessage)
-async def handler(event):
-    global current_thumb, rename_template, paused
-
-    msg = event.message
-
-    if not event.is_private:
-        return
-    if msg.peer_id.user_id != (await client.get_me()).id:
-        return
-
-    # -------- STOP --------
-    if msg.raw_text == "/stop":
-        paused = True
-        dropped = await clear_queue()
-        await msg.reply(f"⏸ Stopped. Dropped {dropped} queued videos.")
-        return
-
-    # -------- RESUME (RESTART) --------
-    if paused:
-        paused = False
-        dropped = await clear_queue()
-        await msg.reply(f"🔄 Restarted. Old queue cleared ({dropped}).")
-
-    # -------- RENAME --------
-    if msg.raw_text.startswith("/rename"):
-        parts = msg.raw_text.split(" ", 1)
-        rename_template = None if len(parts) == 1 else parts[1].strip()
-        await msg.reply("✏️ Rename template saved")
-        return
-
-    # -------- THUMB --------
-    if msg.photo:
-        src = await msg.download_media(file=thumb_src)
-        optimize_thumbnail(src, thumb_final)
-        current_thumb = thumb_final
-        await msg.reply("🖼 Thumbnail saved")
-        return
-
-    # -------- VIDEO --------
-    if msg.video and current_thumb:
-        await queue.put((
-            msg,
-            current_thumb,
-            rename_template
-        ))
-        await msg.reply("📥 Added to queue")
-
-# ================= MAIN =================
-async def main():
-    await client.start()
-    try:
-        await client(ImportChatInviteRequest(CHANNEL_INVITE))
-    except:
-        pass
-
-    asyncio.create_task(worker())
-    await client.run_until_disconnected()
-
-# ================= WEB =================
+# ================= FLASK APP =================
 app = Flask(__name__)
 
-@app.route("/")
-@app.route("/health")
+@app.route("/health", methods=["GET"])
 def health():
-    return "OK", 200
+    return jsonify({"status": "ok"}), 200
 
-def run_web():
+
+def run_flask():
     app.run(host="0.0.0.0", port=PORT)
 
-Thread(target=run_web, daemon=True).start()
 
-# ================= START =================
-asyncio.get_event_loop().run_until_complete(main())
+# ================= MEMORY =================
+caption_template = {}   # uid -> template
+media_queue = {}        # uid -> list of dicts
+# ==========================================
+
+
+# -------- STRICT EP EXTRACTOR --------
+def extract_episode(text):
+    if not text:
+        return None
+
+    pattern = re.compile(
+        r'(?:episode|ep|e)\s*[-:#]?\s*(\d{1,4})',
+        re.IGNORECASE
+    )
+    m = pattern.search(text)
+    return int(m.group(1)) if m else None
+
+
+# -------- /caption --------
+def caption_cmd(update: Update, context: CallbackContext):
+    uid = update.effective_user.id
+
+    if not context.args:
+        update.message.reply_text(
+            "❌ Usage:\n/caption <template with {ep}>"
+        )
+        return
+
+    caption_template[uid] = update.message.text.split(" ", 1)[1]
+    media_queue[uid] = []
+
+    update.message.reply_text(
+        "✅ Caption saved.\nSend up to 99 files."
+    )
+
+
+# -------- MEDIA COLLECTOR --------
+def collect_media(update: Update, context: CallbackContext):
+    uid = update.effective_user.id
+
+    if uid not in caption_template:
+        return
+
+    if len(media_queue[uid]) >= 99:
+        update.message.reply_text("⚠️ Limit reached (99 files).")
+        return
+
+    msg = update.message
+    original_caption = msg.caption or ""
+    ep = extract_episode(original_caption)
+
+    if ep is None:
+        update.message.reply_text("❌ Episode not found in caption.")
+        return
+
+    media_queue[uid].append({
+        "ep": ep,
+        "message": msg
+    })
+
+
+# -------- PROCESS QUEUE (SORTED) --------
+def process_queue(update: Update, context: CallbackContext, target):
+    uid = update.effective_user.id
+
+    if uid not in media_queue or not media_queue[uid]:
+        update.message.reply_text("❌ No files queued.")
+        return
+
+    template = caption_template[uid]
+
+    # SORT BY EPISODE ASC
+    items = sorted(media_queue[uid], key=lambda x: x["ep"])
+
+    for item in items:
+        msg = item["message"]
+        ep = item["ep"]
+
+        final_caption = (
+            template.replace("{ep}", str(ep))
+            if "{ep}" in template
+            else template
+        )
+
+        if msg.photo:
+            context.bot.send_photo(
+                chat_id=target,
+                photo=msg.photo[-1].file_id,
+                caption=final_caption
+            )
+
+        elif msg.video:
+            context.bot.send_video(
+                chat_id=target,
+                video=msg.video.file_id,
+                caption=final_caption
+            )
+
+        elif msg.document:
+            context.bot.send_document(
+                chat_id=target,
+                document=msg.document.file_id,
+                caption=final_caption
+            )
+
+    # CLEAR MEMORY
+    caption_template.pop(uid, None)
+    media_queue.pop(uid, None)
+
+    update.message.reply_text("✅ Done")
+
+
+# -------- /give --------
+def give_cmd(update: Update, context: CallbackContext):
+    process_queue(update, context, update.effective_chat.id)
+
+
+# -------- /forward --------
+def forward_cmd(update: Update, context: CallbackContext):
+    if not context.args:
+        update.message.reply_text(
+            "❌ Usage:\n/forward <channel_id>"
+        )
+        return
+
+    target = context.args[0]
+    process_queue(update, context, target)
+
+
+# -------- BOT RUNNER --------
+def run_bot():
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("caption", caption_cmd))
+    dp.add_handler(CommandHandler("give", give_cmd))
+    dp.add_handler(CommandHandler("forward", forward_cmd))
+
+    dp.add_handler(
+        MessageHandler(
+            Filters.photo | Filters.video | Filters.document,
+            collect_media
+        )
+    )
+
+    updater.start_polling()
+    updater.idle()
+
+
+# -------- MAIN --------
+if __name__ == "__main__":
+    # Flask thread (for /health)
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    # Telegram bot polling
+    run_bot()
